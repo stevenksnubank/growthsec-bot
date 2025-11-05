@@ -31,12 +31,20 @@ export KB_BASE_URL="https://api.your-domain.com"
 export KB_NAME="internal-help"
 export KB_TOKEN="..."
 export PORT=3000
+export LOG_LEVEL=INFO
 # Optional for Socket Mode:
 # export SLACK_APP_TOKEN="xapp-..."
 # Retrieval tuning (optional):
 # export KB_LIMIT=5
 # export KB_CACHE_TTL_S=300
 # export KB_FILTERS_JSON='{"project":"growthsec"}'
+# MCP adapter (optional):
+# export KB_USE_MCP=true
+# export KB_MCP_SERVER_COMMAND="/absolute/path/to/nu/nucli/nucli.d/llm.d/mcp.d/kb.d/run"
+# export KB_MCP_SERVER_ARGS=""
+# export KB_MCP_SERVER_ENV_JSON='{"PATH":"$PATH"}'
+# export KB_MCP_EXPAND_WINDOW=4000
+# export KB_INDEX_NAME="knowledge-base-index"
 ```
 
 4. Run the app:
@@ -62,8 +70,10 @@ python app.py
 
 - The bot normalizes the query text (removes Slack formatting, code blocks, extra whitespace) and guards against too-short queries.
 - It validates the configured knowledge base once, then performs a search:
-  - Per-KB: `POST {KB_BASE_URL}/api/v1/knowledge-bases/{KB_NAME}/search`
-  - Global (fallback): `POST {KB_BASE_URL}/api/v1/knowledge-bases/search`
+  - If `KB_USE_MCP=true`, the bot spawns the `nu-knowledge-base-mcp-nu-cli` stdio server and calls the `searchKnowledgeBase` tool.
+  - Otherwise it uses HTTP / CLI fallbacks:
+    - Per-KB: `POST {KB_BASE_URL}/api/v1/knowledge-bases/{KB_NAME}/search`
+    - Global: `POST {KB_BASE_URL}/api/v1/knowledge-bases/search` (via `nu-cli` when `KB_USE_NUCLI=true`)
 - It uses a small in-memory cache with TTL and gentle retry/backoff on `429` responses.
 - Results are posted back using Slack blocks (title, source link, snippet).
 
@@ -73,6 +83,16 @@ python app.py
 - DMs: messages in IMs are treated as full queries.
 - Tuning: `KB_LIMIT`, `KB_CACHE_TTL_S`, and optional `KB_FILTERS_JSON` can narrow/optimize retrieval.
 - Ingestion/maintenance endpoints (indexes/items) are not used by the bot and should run in a separate pipeline.
+
+### MCP integration (optional)
+
+- Set `KB_USE_MCP=true` to route queries through the MCP server shipped in `nu-knowledge-base-mcp-nu-cli`.
+- Provide `KB_MCP_SERVER_COMMAND` (usually `~/dev/nu/nucli/nucli.d/llm.d/mcp.d/kb.d/run`) and optional `KB_MCP_SERVER_ARGS` if you need to wrap the invocation (e.g. `-lc "..."`).
+- The bot passes your current environment to the subprocess; use `KB_MCP_SERVER_ENV_JSON` to add or override specific variables (for example to inject a custom `PATH`).
+- Optional knobs:
+  - `KB_INDEX_NAME` to scope searches to a specific index.
+  - `KB_MCP_EXPAND_WINDOW` to override the server’s expand window (default 4000 tokens).
+- Slack will continue to use the same block formatting—the MCP server simply feeds the evidence list while centralising query expansion and re-ranking logic.
 
 ### Testing
 

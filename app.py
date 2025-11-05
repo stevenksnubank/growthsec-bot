@@ -2,6 +2,7 @@ import os
 import re
 import time
 import json
+import logging
 from urllib.parse import quote, urlparse
 import subprocess
 import requests
@@ -9,7 +10,19 @@ import boto3
 from slack_bolt import App
 from slack_bolt.adapter.aws_lambda import SlackRequestHandler
 from dotenv import load_dotenv
+
+from kb_mcp_client import KnowledgeBaseMCPClient, parse_server_args
 load_dotenv()
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_resolved_level = getattr(logging, LOG_LEVEL, None)
+if not isinstance(_resolved_level, int):
+    _resolved_level = logging.INFO
+logging.basicConfig(level=_resolved_level)
+logging.getLogger(__name__).info(
+    "Logging configured",
+    extra={"LOG_LEVEL": LOG_LEVEL, "effective_level": logging.getLevelName(_resolved_level)},
+)
 
 def kb_search_url():
     base = KB_BASE_URL.rstrip("/")
@@ -46,6 +59,7 @@ NU_CLI_BIN = os.getenv("NU_CLI_BIN", "nu-ist")
 NU_ENV = os.getenv("NU_ENV", "prod")
 NU_SHARD = os.getenv("NU_SHARD", "global")
 NU_SERVICE = os.getenv("NU_SERVICE", "llm-data-source")
+NU_ACCOUNT = os.getenv("NU_ACCOUNT")  # optional, e.g., "ist"
 
 # Optional filters for narrowing results
 _filters_env = os.getenv("KB_FILTERS_JSON")
@@ -53,6 +67,57 @@ try:
     KB_FILTERS = json.loads(_filters_env) if _filters_env else None
 except Exception:
     KB_FILTERS = None
+
+
+def _split_env_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [item.strip().lower() for item in raw.split(",") if item.strip()]
+
+
+def _parse_env_float(name: str, default: str) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+KB_TITLE_BOOST_KEYWORDS = _split_env_list(os.getenv("KB_TITLE_BOOST_KEYWORDS"))
+KB_URI_BOOST_SUBSTRINGS = _split_env_list(os.getenv("KB_URI_BOOST_SUBSTRINGS"))
+KB_TITLE_BOOST_WEIGHT = _parse_env_float("KB_TITLE_BOOST_WEIGHT", "5")
+KB_URI_BOOST_WEIGHT = _parse_env_float("KB_URI_BOOST_WEIGHT", "3")
+
+KB_INDEX_NAME = os.getenv("KB_INDEX_NAME")
+
+
+def _parse_optional_int(raw: str | None) -> int | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+KB_USE_MCP = os.getenv("KB_USE_MCP", "0").lower() in ("1", "true", "yes")
+KB_MCP_SERVER_COMMAND = os.getenv("KB_MCP_SERVER_COMMAND")
+if not KB_MCP_SERVER_COMMAND:
+    _nucli_home = os.environ.get("NUCLI_HOME")
+    if _nucli_home:
+        _default_mcp_run = os.path.join(
+            _nucli_home,
+            "nucli.d",
+            "llm.d",
+            "mcp.d",
+            "kb.d",
+            "run",
+        )
+        if os.path.isfile(_default_mcp_run):
+            KB_MCP_SERVER_COMMAND = _default_mcp_run
+
+KB_MCP_SERVER_ARGS = parse_server_args(os.getenv("KB_MCP_SERVER_ARGS"))
+KB_MCP_SERVER_ENV_JSON = os.getenv("KB_MCP_SERVER_ENV_JSON")
+KB_MCP_EXPAND_WINDOW = _parse_optional_int(os.getenv("KB_MCP_EXPAND_WINDOW"))
 
 # Simple in-memory cache: query -> (expires_at, results)
 _kb_cache = {}
@@ -69,6 +134,58 @@ def get_cached_results(q):
 
 def set_cached_results(q, results):
     _kb_cache[q] = (time.time() + KB_CACHE_TTL_S, results)
+
+
+def _build_mcp_env() -> dict[str, str]:
+    env = dict(os.environ)
+    if KB_MCP_SERVER_ENV_JSON:
+        try:
+            extra = json.loads(KB_MCP_SERVER_ENV_JSON)
+            if isinstance(extra, dict):
+                for key, value in extra.items():
+                    if value is not None:
+                        env[str(key)] = str(value)
+        except Exception:
+            pass
+    return env
+
+
+_kb_mcp_client: KnowledgeBaseMCPClient | None = None
+
+
+def _get_mcp_client(logger=None) -> KnowledgeBaseMCPClient | None:
+    global _kb_mcp_client
+    if _kb_mcp_client is not None:
+        return _kb_mcp_client
+
+    if not KB_MCP_SERVER_COMMAND:
+        if logger:
+            logger.error(
+                "KB_MCP_SERVER_COMMAND is not configured; cannot use MCP knowledge base search."
+            )
+        return None
+
+    try:
+        client = KnowledgeBaseMCPClient(
+            command=KB_MCP_SERVER_COMMAND,
+            args=KB_MCP_SERVER_ARGS,
+            env=_build_mcp_env(),
+            default_kb=KB_NAME,
+        )
+        if logger:
+            logger.info(
+                "Initialized KB MCP client",
+                extra={
+                    "command": KB_MCP_SERVER_COMMAND,
+                    "args_list": KB_MCP_SERVER_ARGS,
+                },
+            )
+        _kb_mcp_client = client
+        return client
+    except Exception as exc:
+        if logger:
+            logger.error(f"Failed to initialize Knowledge Base MCP client: {exc}")
+        return None
 
 
 def normalize_query(text: str) -> str:
@@ -136,11 +253,54 @@ def _presign_s3_object(bucket: str, key: str) -> str | None:
 
 _kb_validated = False
 
+
+def _rerank_results(results: list[dict], query: str) -> list[dict]:
+    if not results:
+        return results
+
+    q_lower = (query or "").lower()
+    query_terms = {term for term in re.findall(r"\w+", q_lower) if len(term) > 2}
+
+    def compute_score(result: dict) -> float:
+        base = result.get("score")
+        try:
+            score = float(base)
+        except (TypeError, ValueError):
+            score = 0.0
+
+        title = (result.get("title") or "").lower()
+        uri = (result.get("uri") or "").lower()
+        bonus = 0.0
+
+        if q_lower and q_lower in title:
+            bonus += KB_TITLE_BOOST_WEIGHT
+        elif query_terms:
+            matched_terms = sum(1 for term in query_terms if term in title)
+            if matched_terms:
+                bonus += KB_TITLE_BOOST_WEIGHT * (matched_terms / len(query_terms))
+
+        for kw in KB_TITLE_BOOST_KEYWORDS:
+            if kw and kw in title:
+                bonus += KB_TITLE_BOOST_WEIGHT
+                break
+
+        for pattern in KB_URI_BOOST_SUBSTRINGS:
+            if pattern and pattern in uri:
+                bonus += KB_URI_BOOST_WEIGHT
+                break
+
+        return score + bonus
+
+    return sorted(results, key=compute_score, reverse=True)
+
 def validate_kb(logger=None) -> bool:
     global _kb_validated
     if _kb_validated:
         return True
     if not KB_NAME:
+        _kb_validated = True
+        return True
+    if KB_USE_MCP:
         _kb_validated = True
         return True
     if KB_USE_NUCLI:
@@ -192,74 +352,148 @@ def search_and_respond(query, channel_id, thread_ts, client, logger):
     )
 
     # 2. Build and execute the KB search request
-    if not validate_kb(logger):
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text="Knowledge base is not accessible right now. Please try again later.",
-        )
-        return
-
-    url = kb_search_url()
-    headers = {
-        "Authorization": f"Bearer {KB_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "query": query,
-        "limit": KB_LIMIT,
-    }
-    if KB_FILTERS:
-        payload["filters"] = KB_FILTERS
-
     try:
-        # Use cache first
         results = get_cached_results(query)
-        if results is None:
-            if KB_USE_NUCLI:
-                # Use global multi-KB search via CLI for reliability behind corp network
-                kb_payload = {
-                    "query": query,
-                    "knowledge-bases": [{"name": KB_NAME}],
-                    "num-results": KB_LIMIT,
-                }
-                # Map filters if present (API uses 'filter')
-                if KB_FILTERS:
-                    kb_payload["filter"] = KB_FILTERS
-                cmd = [
-                    NU_CLI_BIN,
-                    "ser",
-                    "curl",
-                    "--env",
-                    NU_ENV,
-                    "POST",
-                    NU_SHARD,
-                    NU_SERVICE,
-                    "/api/v1/knowledge-bases/search",
-                    "--data",
-                    json.dumps(kb_payload),
-                ]
+        if results is None and KB_USE_MCP:
+            mcp_client = _get_mcp_client(logger)
+            if mcp_client:
+                try:
+                    mcp_response = mcp_client.search(
+                        query,
+                        kb_name=KB_NAME,
+                        index_name=KB_INDEX_NAME,
+                        num_results=KB_LIMIT,
+                        expand_window=KB_MCP_EXPAND_WINDOW,
+                        filters=KB_FILTERS,
+                        logger=logger,
+                    )
+                    results = mcp_response.get("results", [])
+                    if logger:
+                        logger.info(
+                            "KB MCP search completed",
+                            extra={
+                                "query": query,
+                                "results": len(results or []),
+                            },
+                        )
+                except Exception as mcp_error:
+                    if logger:
+                        logger.error(f"MCP knowledge base search failed: {mcp_error}")
+                    results = None
+
+        if results is None and KB_USE_NUCLI:
+            if logger:
+                logger.info(
+                    "Falling back to nu-cli KB search",
+                    extra={"query": query},
+                )
+            kb_payload = {
+                "query": query,
+                "knowledge-bases": [{"name": KB_NAME}],
+                "num-results": KB_LIMIT,
+            }
+            if KB_FILTERS:
+                kb_payload["filter"] = KB_FILTERS
+            cmd = [NU_CLI_BIN, "ser", "curl", "--env", NU_ENV]
+            if NU_ACCOUNT:
+                cmd += ["--account", NU_ACCOUNT]
+            cmd += [
+                "POST",
+                NU_SHARD,
+                NU_SERVICE,
+                "/api/v1/knowledge-bases/search",
+                "--data",
+                json.dumps(kb_payload),
+            ]
+            try:
                 completed = subprocess.run(
                     cmd,
                     check=True,
                     capture_output=True,
                     text=True,
-                    timeout=20,
+                    timeout=30,
                 )
                 data = json.loads(completed.stdout) if completed.stdout else {}
                 results = data.get("results", []) if isinstance(data, dict) else []
-                set_cached_results(query, results)
-            else:
-                for attempt in range(3):
-                    resp = requests.post(url, headers=headers, json=payload, timeout=10)
-                    if resp.status_code == 429 and attempt < 2:
-                        time.sleep(2 ** attempt)
-                        continue
-                    resp.raise_for_status()
-                    data = resp.json()
+            except subprocess.CalledProcessError as e:
+                if logger:
+                    logger.error(f"nu-cli global search failed (rc={e.returncode}): {e.stderr}")
+                kb_payload_pk = {"query": query, "num-results": KB_LIMIT}
+                if KB_FILTERS:
+                    kb_payload_pk["filter"] = KB_FILTERS
+                cmd_pk = [NU_CLI_BIN, "ser", "curl", "--env", NU_ENV]
+                if NU_ACCOUNT:
+                    cmd_pk += ["--account", NU_ACCOUNT]
+                cmd_pk += [
+                    "POST",
+                    NU_SHARD,
+                    NU_SERVICE,
+                    f"/api/v1/knowledge-bases/{quote(KB_NAME, safe='')}/search",
+                    "--data",
+                    json.dumps(kb_payload_pk),
+                ]
+                try:
+                    completed_pk = subprocess.run(
+                        cmd_pk,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    data = json.loads(completed_pk.stdout) if completed_pk.stdout else {}
                     results = data.get("results", []) if isinstance(data, dict) else []
-                    set_cached_results(query, results)
-                    break
+                except subprocess.CalledProcessError as cli_error:
+                    if logger:
+                        logger.error(f"nu-cli per-KB search failed (rc={cli_error.returncode}): {cli_error.stderr}")
+                    results = None
+
+        if results is None:
+            if not validate_kb(logger):
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text="Knowledge base is not accessible right now. Please try again later.",
+                )
+                return
+
+            url = kb_search_url()
+            headers = {
+                "Authorization": f"Bearer {KB_TOKEN}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "query": query,
+                "limit": KB_LIMIT,
+            }
+            if KB_FILTERS:
+                payload["filters"] = KB_FILTERS
+
+            for attempt in range(3):
+                if logger:
+                    logger.info(
+                        "Calling KB HTTP search",
+                        extra={"query": query, "attempt": attempt + 1},
+                    )
+                resp = requests.post(url, headers=headers, json=payload, timeout=10)
+                if resp.status_code == 429 and attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                results = data.get("results", []) if isinstance(data, dict) else []
+                break
+
+        if results is not None:
+            results = _rerank_results(results, query)
+            set_cached_results(query, results)
+            if logger:
+                logger.info(
+                    "KB search finished",
+                    extra={
+                        "query": query,
+                        "result_count": len(results or []),
+                    },
+                )
 
         if not results:
             client.chat_postMessage(
@@ -318,7 +552,7 @@ def search_and_respond(query, channel_id, thread_ts, client, logger):
             blocks=blocks,
         )
         
-    except requests.RequestException as e:
+    except Exception as e:
         logger.error(
             f"KB search error: {getattr(e, 'response', None) and e.response.text or e}"
         )
